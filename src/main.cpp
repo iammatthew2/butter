@@ -32,6 +32,9 @@ constexpr int kLcdCols = 16;
 constexpr int kLcdRows = 2;
 constexpr int kMaxTopicChars = 63;
 constexpr int kMaxPayloadChars = 63;
+constexpr int kMessageHistorySize = 20;
+constexpr TickType_t kLcdIdleTimeoutTicks = pdMS_TO_TICKS(20000);
+constexpr TickType_t kButtonDebounceTicks = pdMS_TO_TICKS(160);
 
 constexpr EventBits_t kWiFiConnectedBit = BIT0;
 constexpr EventBits_t kMqttConnectedBit = BIT1;
@@ -55,6 +58,18 @@ constexpr uint8_t kPinEnable = 13;
 constexpr uint8_t kPinRw = 14;
 constexpr uint8_t kPinRs = 15;
 
+// Button bits from MCP GPIOA (active-low -> inverted mask)
+constexpr uint8_t kButtonSelect = 0x01;
+constexpr uint8_t kButtonRight = 0x02;
+constexpr uint8_t kButtonDown = 0x04;
+constexpr uint8_t kButtonUp = 0x08;
+constexpr uint8_t kButtonLeft = 0x10;
+
+struct MessageEntry {
+  char topic[kMaxTopicChars + 1];
+  char payload[kMaxPayloadChars + 1];
+};
+
 uint16_t g_gpioab_shadow = 0;
 EventGroupHandle_t g_state_bits = nullptr;
 SemaphoreHandle_t g_lcd_mutex = nullptr;
@@ -64,6 +79,17 @@ esp_mqtt_client_handle_t g_mqtt_client = nullptr;
 bool g_has_new_message = false;
 char g_last_topic[kMaxTopicChars + 1] = {0};
 char g_last_payload[kMaxPayloadChars + 1] = {0};
+TickType_t g_last_mqtt_event_tick = 0;
+bool g_backlight_on = true;
+char g_display_topic[kMaxTopicChars + 1] = {0};
+char g_display_payload[kMaxPayloadChars + 1] = {0};
+int g_scroll_offset = 0;
+uint8_t g_last_buttons = 0;
+TickType_t g_last_button_tick = 0;
+MessageEntry g_message_history[kMessageHistorySize] = {};
+int g_history_head = -1;  // index of newest message in ring buffer
+int g_history_count = 0;  // number of valid messages in ring buffer
+int g_selected_age = 0;   // 0=newest, 1=previous, ...
 
 esp_err_t mcp_write_reg(uint8_t reg, uint8_t value) {
   const uint8_t payload[2] = {reg, value};
@@ -206,6 +232,94 @@ void lcd_show_two_lines(const char* line0, const char* line1) {
   xSemaphoreGive(g_lcd_mutex);
 }
 
+uint8_t lcd_read_buttons() {
+  uint8_t gpioa = 0xFF;
+  if (mcp_read_reg(kRegGpioA, &gpioa) != ESP_OK) {
+    return 0;
+  }
+  // Active-low buttons on GPA0..GPA4.
+  return static_cast<uint8_t>((~gpioa) & 0x1F);
+}
+
+void build_scrolled_line(char prefix, const char* source, int offset,
+                         char out[kLcdCols + 1]) {
+  out[0] = prefix;
+  out[1] = ':';
+
+  const int source_len = static_cast<int>(strlen(source));
+  for (int i = 0; i < (kLcdCols - 2); ++i) {
+    const int source_idx = offset + i;
+    if (source_idx >= 0 && source_idx < source_len) {
+      const unsigned char c = static_cast<unsigned char>(source[source_idx]);
+      out[i + 2] = isprint(c) ? static_cast<char>(c) : '.';
+    } else {
+      out[i + 2] = ' ';
+    }
+  }
+
+  out[kLcdCols] = '\0';
+}
+
+void render_scrolled_message() {
+  char topic_line[kLcdCols + 1];
+  char payload_line[kLcdCols + 1];
+  build_scrolled_line('T', g_display_topic, g_scroll_offset, topic_line);
+  build_scrolled_line('M', g_display_payload, g_scroll_offset, payload_line);
+  lcd_show_two_lines(topic_line, payload_line);
+}
+
+int history_index_from_age_locked(int age) {
+  if (g_history_count <= 0 || g_history_head < 0) {
+    return -1;
+  }
+  const int clamped_age =
+      (age < 0) ? 0 : ((age >= g_history_count) ? (g_history_count - 1) : age);
+  int index = g_history_head - clamped_age;
+  while (index < 0) {
+    index += kMessageHistorySize;
+  }
+  return index % kMessageHistorySize;
+}
+
+void set_display_from_selected_locked() {
+  if (g_history_count <= 0) {
+    g_display_topic[0] = '\0';
+    g_display_payload[0] = '\0';
+    return;
+  }
+
+  const int idx = history_index_from_age_locked(g_selected_age);
+  if (idx < 0) {
+    return;
+  }
+
+  strncpy(g_display_topic, g_message_history[idx].topic,
+          sizeof(g_display_topic) - 1);
+  g_display_topic[sizeof(g_display_topic) - 1] = '\0';
+  strncpy(g_display_payload, g_message_history[idx].payload,
+          sizeof(g_display_payload) - 1);
+  g_display_payload[sizeof(g_display_payload) - 1] = '\0';
+}
+
+void set_backlight_enabled(bool enabled) {
+  if (g_lcd_mutex == nullptr) {
+    return;
+  }
+
+  if (xSemaphoreTake(g_lcd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    return;
+  }
+
+  const esp_err_t err = lcd_set_backlight(enabled ? 0x07 : 0x00);
+  if (err == ESP_OK) {
+    g_backlight_on = enabled;
+  } else {
+    ESP_LOGW(TAG, "Backlight update failed: %s", esp_err_to_name(err));
+  }
+
+  xSemaphoreGive(g_lcd_mutex);
+}
+
 esp_err_t lcd_init() {
   // A0..A4 are buttons (inputs). A5..A7 and all B are outputs.
   esp_err_t err = mcp_write_reg(kRegIodirA, 0x1F);
@@ -327,6 +441,8 @@ bool i2c_address_responds(uint8_t address) {
 
 void remember_message(const char* topic, int topic_len, const char* data,
                       int data_len) {
+  g_last_mqtt_event_tick = xTaskGetTickCount();
+
   if (g_message_mutex == nullptr) {
     return;
   }
@@ -350,8 +466,48 @@ void remember_message(const char* topic, int topic_len, const char* data,
   }
   g_last_payload[data_copy_len] = '\0';
 
-  g_has_new_message = true;
+  const bool was_browsing_history = (g_history_count > 0 && g_selected_age > 0);
+
+  g_history_head = (g_history_head + 1) % kMessageHistorySize;
+  strncpy(g_message_history[g_history_head].topic, g_last_topic,
+          sizeof(g_message_history[g_history_head].topic) - 1);
+  g_message_history[g_history_head]
+      .topic[sizeof(g_message_history[g_history_head].topic) - 1] = '\0';
+  strncpy(g_message_history[g_history_head].payload, g_last_payload,
+          sizeof(g_message_history[g_history_head].payload) - 1);
+  g_message_history[g_history_head]
+      .payload[sizeof(g_message_history[g_history_head].payload) - 1] = '\0';
+
+  if (g_history_count < kMessageHistorySize) {
+    ++g_history_count;
+  }
+
+  if (was_browsing_history && g_selected_age < (g_history_count - 1)) {
+    ++g_selected_age;
+  }
+
+  if (g_selected_age == 0) {
+    set_display_from_selected_locked();
+    g_scroll_offset = 0;
+    g_has_new_message = true;
+  }
+
   xSemaphoreGive(g_message_mutex);
+}
+
+void update_lcd_idle_state() {
+  const TickType_t now = xTaskGetTickCount();
+  const TickType_t elapsed = now - g_last_mqtt_event_tick;
+
+  if (g_backlight_on && elapsed >= kLcdIdleTimeoutTicks) {
+    ESP_LOGI(TAG, "No MQTT events for 20s, turning LCD backlight off");
+    set_backlight_enabled(false);
+    return;
+  }
+
+  if (!g_backlight_on && elapsed < kLcdIdleTimeoutTicks) {
+    set_backlight_enabled(true);
+  }
 }
 
 void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -470,17 +626,11 @@ void handle_latest_message_for_lcd() {
     return;
   }
 
-  char topic[kMaxTopicChars + 1];
-  char payload[kMaxPayloadChars + 1];
   bool has_new = false;
 
   if (xSemaphoreTake(g_message_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     has_new = g_has_new_message;
     if (has_new) {
-      strncpy(topic, g_last_topic, sizeof(topic) - 1);
-      topic[sizeof(topic) - 1] = '\0';
-      strncpy(payload, g_last_payload, sizeof(payload) - 1);
-      payload[sizeof(payload) - 1] = '\0';
       g_has_new_message = false;
     }
     xSemaphoreGive(g_message_mutex);
@@ -490,23 +640,106 @@ void handle_latest_message_for_lcd() {
     return;
   }
 
-  char line0[kLcdCols + 1];
-  char line1[kLcdCols + 1];
+  if (!g_backlight_on) {
+    set_backlight_enabled(true);
+  }
+  render_scrolled_message();
+}
 
-  memset(line0, ' ', sizeof(line0) - 1);
-  memset(line1, ' ', sizeof(line1) - 1);
-  line0[kLcdCols] = '\0';
-  line1[kLcdCols] = '\0';
+void handle_scroll_buttons() {
+  const TickType_t now = xTaskGetTickCount();
+  if ((now - g_last_button_tick) < kButtonDebounceTicks) {
+    return;
+  }
 
-  line0[0] = 'T';
-  line0[1] = ':';
-  line1[0] = 'M';
-  line1[1] = ':';
+  const uint8_t buttons = lcd_read_buttons();
+  const uint8_t rising_edges =
+      static_cast<uint8_t>(buttons & (~g_last_buttons));
+  g_last_buttons = buttons;
 
-  strncpy(&line0[2], topic, kLcdCols - 2);
-  strncpy(&line1[2], payload, kLcdCols - 2);
+  // Any button press counts as activity for the backlight idle timer.
+  if (rising_edges != 0) {
+    g_last_mqtt_event_tick = now;
+    if (!g_backlight_on) {
+      set_backlight_enabled(true);
+    }
+    g_last_button_tick = now;
+  }
 
-  lcd_show_two_lines(line0, line1);
+  int delta = 0;
+  int vertical_delta = 0;
+  if ((rising_edges & kButtonLeft) != 0) {
+    delta = -1;
+  } else if ((rising_edges & kButtonRight) != 0) {
+    delta = 1;
+  } else if ((rising_edges & kButtonUp) != 0) {
+    vertical_delta = 1;  // older
+  } else if ((rising_edges & kButtonDown) != 0) {
+    vertical_delta = -1;  // newer
+  } else if ((rising_edges & kButtonSelect) != 0) {
+    vertical_delta = -999;  // jump to newest
+  }
+
+  if (vertical_delta != 0) {
+    bool changed = false;
+    if (xSemaphoreTake(g_message_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (g_history_count > 0) {
+        int next_age = g_selected_age;
+        if (vertical_delta == -999) {
+          next_age = 0;
+        } else {
+          next_age += vertical_delta;
+        }
+
+        if (next_age < 0) {
+          next_age = 0;
+        }
+        if (next_age >= g_history_count) {
+          next_age = g_history_count - 1;
+        }
+
+        if (next_age != g_selected_age) {
+          g_selected_age = next_age;
+          set_display_from_selected_locked();
+          g_scroll_offset = 0;
+          changed = true;
+        }
+      }
+      xSemaphoreGive(g_message_mutex);
+    }
+
+    if (changed) {
+      render_scrolled_message();
+    }
+    return;
+  }
+
+  if (delta == 0) {
+    return;
+  }
+
+  const int max_len = (strlen(g_display_topic) > strlen(g_display_payload))
+                          ? static_cast<int>(strlen(g_display_topic))
+                          : static_cast<int>(strlen(g_display_payload));
+  const int max_offset =
+      (max_len > (kLcdCols - 2)) ? (max_len - (kLcdCols - 2)) : 0;
+
+  int new_offset = g_scroll_offset + delta;
+  if (new_offset < 0) {
+    new_offset = 0;
+  }
+  if (new_offset > max_offset) {
+    new_offset = max_offset;
+  }
+
+  if (new_offset == g_scroll_offset) {
+    g_last_button_tick = now;
+    return;
+  }
+
+  g_scroll_offset = new_offset;
+
+  render_scrolled_message();
 }
 
 void init_nvs() {
@@ -529,6 +762,7 @@ extern "C" void app_main(void) {
   g_state_bits = xEventGroupCreate();
   g_lcd_mutex = xSemaphoreCreateMutex();
   g_message_mutex = xSemaphoreCreateMutex();
+  g_last_mqtt_event_tick = xTaskGetTickCount();
 
   init_nvs();
 
@@ -547,6 +781,8 @@ extern "C" void app_main(void) {
 
   while (true) {
     handle_latest_message_for_lcd();
+    handle_scroll_buttons();
+    update_lcd_idle_state();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
