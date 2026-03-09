@@ -4,6 +4,10 @@ ESP32-C6 (Seeed XIAO) + Adafruit 16x2 LCD Pi Plate over I2C.
 
 This project listens to MQTT events on the local network and shows them on the LCD.
 
+<img width="1351" height="1056" alt="Screenshot 2026-03-09 at 9 50 38 AM" src="https://github.com/user-attachments/assets/c0bdf894-1328-4974-84e4-d3a6159bbaa4" />
+
+
+
 ## Hardware
 - Controller: Seeed XIAO ESP32-C6
 - Display: Adafruit 16x2 RGB LCD Pi Plate
